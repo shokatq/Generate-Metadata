@@ -10,6 +10,7 @@ from functools import wraps
 import time
 import re
 from collections import defaultdict
+import uuid
 
 # File processing libraries
 import PyPDF2
@@ -80,6 +81,141 @@ class FileMetadataGenerator:
         # Chunk size for embeddings (optimize for text-embedding-3-large)
         self.chunk_size = 1000  # Characters per chunk
         self.chunk_overlap = 200  # Overlap between chunks
+
+    def extract_departments_from_path(self, file_path: str) -> List[str]:
+        """Extract departments from file path based on directory structure"""
+        departments = []
+        
+        # Normalize path separators
+        path = file_path.replace('\\', '/').lower()
+        
+        # Define department patterns and keywords
+        department_patterns = {
+            'marketing': ['marketing', 'brand', 'advertising', 'promotion', 'campaign'],
+            'engineering': ['engineering', 'development', 'dev', 'tech', 'software', 'backend', 'frontend'],
+            'sales': ['sales', 'revenue', 'deals', 'prospects', 'crm'],
+            'hr': ['hr', 'human-resources', 'people', 'talent', 'recruitment', 'hiring'],
+            'finance': ['finance', 'accounting', 'budget', 'financial', 'accounting'],
+            'operations': ['operations', 'ops', 'logistics', 'supply-chain'],
+            'legal': ['legal', 'contracts', 'compliance', 'regulatory'],
+            'product': ['product', 'pm', 'product-management', 'roadmap'],
+            'design': ['design', 'ui', 'ux', 'creative', 'graphics'],
+            'data': ['data', 'analytics', 'data-science', 'bi', 'reporting'],
+            'security': ['security', 'infosec', 'cybersecurity', 'privacy'],
+            'support': ['support', 'customer-service', 'help-desk', 'customer-success']
+        }
+        
+        # Check for cross-functional patterns
+        cross_functional_patterns = [
+            'company-wide', 'all-hands', 'cross-functional', 'multi-department',
+            'organization', 'company', 'global', 'enterprise'
+        ]
+        
+        # Split path into segments
+        path_segments = [seg.strip() for seg in path.split('/') if seg.strip()]
+        
+        # Check for cross-functional indicators
+        is_cross_functional = any(pattern in path for pattern in cross_functional_patterns)
+        
+        if is_cross_functional:
+            # For cross-functional files, try to identify specific departments mentioned
+            for dept, keywords in department_patterns.items():
+                if any(keyword in path for keyword in keywords):
+                    departments.append(dept)
+            
+            # If no specific departments found in cross-functional, mark as company-wide
+            if not departments:
+                departments = ['company-wide']
+        else:
+            # Regular department detection
+            for dept, keywords in department_patterns.items():
+                if any(keyword in path for keyword in keywords):
+                    departments.append(dept)
+        
+        # If no departments detected, try to infer from common folder structures
+        if not departments:
+            for segment in path_segments:
+                for dept, keywords in department_patterns.items():
+                    if any(keyword in segment for keyword in keywords):
+                        departments.append(dept)
+                        break
+        
+        # Default fallback
+        if not departments:
+            departments = ['general']
+        
+        return list(set(departments))  # Remove duplicates
+
+    def determine_visibility(self, file_path: str, platform: str, shared_with: List[str] = None, created_by: List[str] = None) -> str:
+        """Determine file visibility based on path, platform, and sharing info"""
+        path_lower = file_path.lower()
+        
+        # Public indicators
+        public_indicators = ['public', 'open', 'everyone', 'all-access', 'external']
+        if any(indicator in path_lower for indicator in public_indicators):
+            return 'public'
+        
+        # Private indicators
+        private_indicators = ['private', 'personal', 'confidential', 'restricted']
+        if any(indicator in path_lower for indicator in private_indicators):
+            return 'private'
+        
+        # Department-specific indicators
+        department_indicators = ['department', 'team', 'group', 'unit']
+        if any(indicator in path_lower for indicator in department_indicators):
+            return 'department'
+        
+        # Check sharing information
+        if shared_with and len(shared_with) > 0:
+            if len(shared_with) > 10:  # Shared with many people
+                return 'internal'
+            else:
+                return 'department'
+        
+        # Platform-based defaults
+        platform_defaults = {
+            'google_drive': 'internal',
+            'onedrive': 'internal', 
+            'dropbox': 'department',
+            'notion': 'internal',
+            'platform_sync': 'internal'
+        }
+        
+        return platform_defaults.get(platform, 'internal')
+
+    def generate_sas_url(self, blob_name: str) -> Optional[str]:
+        """Generate SAS URL for blob with 1-year expiration"""
+        try:
+            from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+            from datetime import timedelta
+            
+            # Extract account name and key from connection string
+            conn_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING_1')
+            conn_parts = dict(item.split('=', 1) for item in conn_string.split(';') if '=' in item)
+            account_name = conn_parts.get('AccountName')
+            account_key = conn_parts.get('AccountKey')
+            
+            if not account_name or not account_key:
+                logger.error("Could not extract account credentials from connection string")
+                return None
+            
+            # Generate SAS token with 1 year expiration
+            sas_token = generate_blob_sas(
+                account_name=account_name,
+                container_name=self.container_name,
+                blob_name=blob_name,
+                account_key=account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.utcnow() + timedelta(days=365)  # 1 year
+            )
+            
+            # Construct full SAS URL
+            sas_url = f"https://{account_name}.blob.core.windows.net/{self.container_name}/{blob_name}?{sas_token}"
+            return sas_url
+            
+        except Exception as e:
+            logger.error(f"Error generating SAS URL: {e}")
+            return None
 
     def is_metadata_updated(self, metadata: Dict[str, Any]) -> bool:
         """Check if metadata has been updated with new fields"""
@@ -163,54 +299,9 @@ class FileMetadataGenerator:
         
         # Normalize quotes
         text = re.sub(r'["""]', '"', text)
-        text = re.sub(r"[’‘']", "'", text)
+        text = re.sub(r"[''']", "'", text)
 
         return text
-
-    def extract_structured_content(self, text: str, file_extension: str) -> Dict[str, Any]:
-        """Extract structured content including headers, lists, tables, etc."""
-        content_structure = {
-            'headings': [],
-            'key_phrases': [],
-            'lists': [],
-            'tables': [],
-            'metadata_tags': []
-        }
-        
-        # Extract headings (common patterns)
-        heading_patterns = [
-            r'^([A-Z][A-Z\s]{10,})\s*$',  # ALL CAPS headings
-            r'^\d+\.\s+([A-Z][a-zA-Z\s]{5,})\s*$',  # Numbered headings
-            r'^([A-Z][a-zA-Z\s]{5,}):\s*$',  # Colon-terminated headings
-        ]
-        
-        for pattern in heading_patterns:
-            matches = re.findall(pattern, text, re.MULTILINE)
-            content_structure['headings'].extend(matches)
-        
-        # Extract lists
-        list_items = re.findall(r'^\s*[-•*]\s+(.+)$', text, re.MULTILINE)
-        content_structure['lists'] = list_items[:20]  # Limit to first 20 items
-        
-        # Extract numbered lists
-        numbered_items = re.findall(r'^\s*\d+\.\s+(.+)$', text, re.MULTILINE)
-        content_structure['lists'].extend(numbered_items[:20])
-        
-        # Extract key phrases (noun phrases and important terms)
-        key_phrase_patterns = [
-            r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b',  # Proper nouns
-            r'\b(?:important|key|critical|essential|main|primary|significant)\s+\w+\b',  # Important terms
-        ]
-        
-        for pattern in key_phrase_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            content_structure['key_phrases'].extend(matches)
-        
-        # Remove duplicates and limit results
-        content_structure['headings'] = list(set(content_structure['headings']))[:10]
-        content_structure['key_phrases'] = list(set(content_structure['key_phrases']))[:20]
-        
-        return content_structure
 
     def create_text_chunks(self, text: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """Create overlapping text chunks for better embedding accuracy"""
@@ -410,157 +501,8 @@ class FileMetadataGenerator:
             logger.warning(f"Unsupported file extension: {file_extension}")
             return ""
 
-    def generate_document_title(self, text_content: str, filename: str, content_structure: Dict[str, Any]) -> str:
-        """Generate document title using GPT-4o with enhanced context"""
-        try:
-            # Use structured content for better title generation
-            context_info = ""
-            
-            if content_structure['headings']:
-                context_info += f"Main headings: {', '.join(content_structure['headings'][:5])}\n"
-            
-            if content_structure['key_phrases']:
-                context_info += f"Key phrases: {', '.join(content_structure['key_phrases'][:10])}\n"
-            
-            # Use first 1500 characters for title generation
-            text_preview = text_content[:1500] if len(text_content) > 1500 else text_content
-            
-            prompt = f"""
-            Based on the following document content and structure, generate a clear, descriptive title.
-            The title should be concise (max 12 words) and capture the main topic or purpose.
-
-            Filename: {filename}
-            
-            Document Structure:
-            {context_info}
-
-            Content Preview:
-            {text_preview}
-
-            Generate a professional title that would help someone understand what this document contains.
-            Return only the title, nothing else.
-            """
-            
-            response = self.openai_text_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are an expert at creating clear, professional document titles that accurately reflect content."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=60,
-                temperature=0.2
-            )
-            
-            title = response.choices[0].message.content.strip()
-            # Remove quotes if present
-            title = title.strip('"').strip("'")
-            return title
-        
-        except Exception as e:
-            logger.error(f"Error generating document title: {str(e)}")
-            # Fallback to filename without extension
-            return os.path.splitext(filename)[0]
-
-    def generate_multi_level_summary(self, text_content: str, document_title: str, content_structure: Dict[str, Any]) -> Dict[str, str]:
-        """Generate multiple summary levels for different use cases"""
-        try:
-            # Truncate text if too long
-            max_chars = 12000
-            if len(text_content) > max_chars:
-                text_content = text_content[:max_chars] + "..."
-            
-            # Prepare context from structure
-            structure_context = ""
-            if content_structure['headings']:
-                structure_context += f"Main sections: {', '.join(content_structure['headings'][:5])}\n"
-            
-            # Generate comprehensive summary
-            comprehensive_prompt = f"""
-            Analyze this document titled "{document_title}" and provide a comprehensive summary.
-            
-            Document Structure:
-            {structure_context}
-            
-            Content:
-            {text_content}
-            
-            Provide a detailed summary (3-4 sentences) that covers:
-            1. Main purpose/topic
-            2. Key points or findings
-            3. Important details or conclusions
-            4. Target audience or use case
-            """
-            
-            # Generate brief summary
-            brief_prompt = f"""
-            Based on this document titled "{document_title}", provide a brief summary.
-            
-            Content:
-            {text_content[:5000]}
-            
-            Provide a concise summary (1-2 sentences) that captures the core purpose and main point.
-            """
-            
-            # Generate keyword summary
-            keywords_prompt = f"""
-            Extract the most important keywords and phrases from this document titled "{document_title}".
-            
-            Content:
-            {text_content[:5000]}
-            
-            Return 10-15 key terms/phrases that best represent this document's content, separated by commas.
-            """
-            
-            summaries = {}
-            
-            # Generate comprehensive summary
-            response = self.openai_text_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are an expert at creating detailed, accurate document summaries."},
-                    {"role": "user", "content": comprehensive_prompt}
-                ],
-                max_tokens=250,
-                temperature=0.3
-            )
-            summaries['comprehensive'] = response.choices[0].message.content.strip()
-            
-            # Generate brief summary
-            response = self.openai_text_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are an expert at creating concise document summaries."},
-                    {"role": "user", "content": brief_prompt}
-                ],
-                max_tokens=100,
-                temperature=0.3
-            )
-            summaries['brief'] = response.choices[0].message.content.strip()
-            
-            # Generate keywords
-            response = self.openai_text_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are an expert at extracting key terms from documents."},
-                    {"role": "user", "content": keywords_prompt}
-                ],
-                max_tokens=100,
-                temperature=0.2
-            )
-            summaries['keywords'] = response.choices[0].message.content.strip()
-            
-            return summaries
-        
-        except Exception as e:
-            logger.error(f"Error generating multi-level summary: {str(e)}")
-            return {
-                'comprehensive': f"Document containing content related to {document_title}",
-                'brief': f"Document about {document_title}",
-                'keywords': document_title
-            }
-
     def generate_chunk_embeddings(self, text_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Generate embeddings for text chunks with enhanced metadata"""
+        """Generate embeddings for text chunks"""
         try:
             chunk_embeddings = []
             
@@ -591,37 +533,88 @@ class FileMetadataGenerator:
             logger.error(f"Error generating chunk embeddings: {str(e)}")
             return []
 
-    def generate_document_embedding(self, text_content: str, summaries: Dict[str, str]) -> List[float]:
-        """Generate document-level embedding using comprehensive summary and key content"""
+    def store_chunk_documents(self, file_id: str, file_name: str, user_id: str, 
+                             chunk_embeddings: List[Dict[str, Any]], 
+                             base_metadata: Dict[str, Any]) -> int:
+        """Store each chunk as a separate document in Cosmos DB with RBAC fields"""
         try:
-            # Combine summary and key content for document embedding
-            embedding_text = f"{summaries['comprehensive']} {summaries['keywords']}"
+            stored_count = 0
+            current_time = datetime.utcnow().isoformat() + 'Z'
             
-            # Add key excerpts from the document
-            if len(text_content) > 2000:
-                # Take beginning and end portions
-                beginning = text_content[:1000]
-                ending = text_content[-1000:]
-                embedding_text += f" {beginning} {ending}"
-            else:
-                embedding_text += f" {text_content}"
+            # Extract base metadata fields
+            created_at = base_metadata.get('created_at', current_time)
+            platform = base_metadata.get('platform', 'platform_sync')
+            mime_type = base_metadata.get('mime_type', 'unknown')
+            file_path = base_metadata.get('filePath', '')
             
-            # Truncate if too long
-            if len(embedding_text) > 8000:
-                embedding_text = embedding_text[:8000]
+            # Extract RBAC fields from base metadata
+            departments = base_metadata.get('department', self.extract_departments_from_path(file_path))
+            shared_with = base_metadata.get('shared_with', [])
+            created_by = base_metadata.get('created_by', [user_id])
+            visibility = base_metadata.get('visibility', self.determine_visibility(file_path, platform, shared_with, created_by))
+            platform_metadata = base_metadata.get('platform_metadata', {})
             
-            response = self.openai_embedding_client.embeddings.create(
-                model="text-embedding-3-large",
-                input=embedding_text,
-                encoding_format="float"
-            )
+            # Generate SAS URL if not present
+            sas_url = base_metadata.get('sas_url')
+            if not sas_url and file_path:
+                sas_url = self.generate_sas_url(file_path)
             
-            return response.data[0].embedding
-        
+            for chunk_data in chunk_embeddings:
+                # Create unique chunk ID
+                chunk_id = f"{file_id}-chunk-{chunk_data['chunk_index']}"
+                
+                # Create chunk document with RBAC fields
+                chunk_document = {
+                    'id': chunk_id,
+                    'chunk_index': chunk_data['chunk_index'],
+                    'text': chunk_data['text'],
+                    'embedding': chunk_data['embedding'],
+                    'file_id': file_id,
+                    'fileName': file_name,
+                    'user_id': user_id,
+                    'platform': platform,
+                    'created_at': created_at,
+                    'mime_type': mime_type,
+                    'processed_at': current_time,
+                    'source': 'platform_sync',
+                    'summary_type': None,
+                    
+                    # RBAC fields
+                    'sas_url': sas_url,
+                    'department': departments if isinstance(departments, list) else [departments],
+                    'shared_with': shared_with if isinstance(shared_with, list) else ([shared_with] if shared_with else []),
+                    'created_by': created_by if isinstance(created_by, list) else ([created_by] if created_by else [user_id]),
+                    'visibility': visibility,
+                    
+                    # Platform-specific metadata
+                    'platform_metadata': platform_metadata,
+                    
+                    # Chunk-specific metadata
+                    'metadata': {
+                        'start_char': chunk_data['start_char'],
+                        'end_char': chunk_data['end_char'],
+                        'text_length': chunk_data['text_length'],
+                        'embedding_model': 'text-embedding-3-large',
+                        'processing_version': '2.0'
+                    }
+                }
+                
+                # Store chunk document
+                try:
+                    self.container.upsert_item(chunk_document)
+                    stored_count += 1
+                    logger.info(f"Stored chunk {chunk_data['chunk_index']} for file {file_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error storing chunk {chunk_data['chunk_index']} for file {file_id}: {str(e)}")
+                    continue
+            
+            logger.info(f"Successfully stored {stored_count} chunks for file {file_id}")
+            return stored_count
+            
         except Exception as e:
-            logger.error(f"Error generating document embedding: {str(e)}")
-            # Return zero vector on error
-            return [0.0] * 3072
+            logger.error(f"Error storing chunk documents: {str(e)}")
+            return 0
 
     def get_existing_metadata(self, file_id: str, user_id: str) -> Dict[str, Any]:
         """Retrieve existing metadata from Cosmos DB"""
@@ -638,24 +631,16 @@ class FileMetadataGenerator:
             logger.error(f"Error retrieving existing metadata: {str(e)}")
             raise Exception(f"Failed to retrieve metadata: {str(e)}")
 
-    def update_metadata_in_cosmos(self, updated_metadata: Dict[str, Any]) -> None:
-        """Update metadata in Cosmos DB"""
-        try:
-            self.container.upsert_item(updated_metadata)
-            logger.info(f"Successfully updated metadata for file ID: {updated_metadata['id']}")
-        
-        except Exception as e:
-            logger.error(f"Error updating metadata in Cosmos DB: {str(e)}")
-            raise Exception(f"Failed to update metadata: {str(e)}")
-
     def process_single_file_metadata(self, metadata: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-        """Process a single file's metadata with enhanced RAG and summarization"""
+        """Process a single file's metadata and store chunks separately with RBAC support"""
         try:
             file_id = metadata.get('id')
             file_path = metadata.get('filePath')
             filename = metadata.get('fileName', '')
+            user_id = metadata.get('user_id')
+            platform = metadata.get('platform', 'platform_sync')
             
-            logger.info(f"Processing enhanced metadata for: {file_id}")
+            logger.info(f"Processing file metadata for: {file_id}")
             
             # Check if file exists in blob storage
             try:
@@ -682,196 +667,300 @@ class FileMetadataGenerator:
             
             logger.info(f"Extracted text length: {len(extracted_text)} characters")
             
-            # Extract structured content
-            logger.info("Extracting structured content...")
-            content_structure = self.extract_structured_content(extracted_text, file_extension)
-            
-            # Create text chunks for embeddings
-            logger.info("Creating text chunks for embeddings...")
+            # Create text chunks
+            logger.info("Creating text chunks...")
             text_chunks = self.create_text_chunks(extracted_text, {
                 'filename': filename,
                 'file_id': file_id,
                 'file_type': file_extension
             })
             
-            # Generate document title
-            logger.info("Generating enhanced document title...")
-            document_title = self.generate_document_title(extracted_text, filename, content_structure)
-            
-            # Generate multi-level summaries
-            logger.info("Generating multi-level summaries...")
-            summaries = self.generate_multi_level_summary(extracted_text, document_title, content_structure)
-            
             # Generate chunk embeddings
             logger.info("Generating chunk embeddings...")
             chunk_embeddings = self.generate_chunk_embeddings(text_chunks)
             
-            # Generate document-level embedding
-            logger.info("Generating document-level embedding...")
-            document_embedding = self.generate_document_embedding(extracted_text, summaries)
+            if not chunk_embeddings:
+                logger.error("No embeddings generated for chunks")
+                return False, "Failed to generate embeddings", metadata
             
-            # Update metadata with enhanced fields
+            # Store chunks as separate documents with RBAC fields
+            logger.info("Storing chunks as separate documents...")
+            stored_count = self.store_chunk_documents(
+                file_id=file_id,
+                file_name=filename,
+                user_id=user_id,
+                chunk_embeddings=chunk_embeddings,
+                base_metadata=metadata
+            )
+            
+            if stored_count == 0:
+                logger.error("No chunks were stored successfully")
+                return False, "Failed to store chunks", metadata
+            
+            # Update original metadata to mark as processed with enhanced RBAC fields
             updated_metadata = metadata.copy()
+            
+            # Extract RBAC fields if not present
+            if 'department' not in updated_metadata:
+                updated_metadata['department'] = self.extract_departments_from_path(file_path)
+            
+            if 'visibility' not in updated_metadata:
+                updated_metadata['visibility'] = self.determine_visibility(
+                    file_path, 
+                    platform, 
+                    updated_metadata.get('shared_with', []),
+                    updated_metadata.get('created_by', [user_id])
+                )
+            
+            if 'sas_url' not in updated_metadata:
+                updated_metadata['sas_url'] = self.generate_sas_url(file_path)
+            
+            # Ensure lists are properly formatted
+            if 'shared_with' in updated_metadata and not isinstance(updated_metadata['shared_with'], list):
+                updated_metadata['shared_with'] = [updated_metadata['shared_with']] if updated_metadata['shared_with'] else []
+            
+            if 'created_by' in updated_metadata and not isinstance(updated_metadata['created_by'], list):
+                updated_metadata['created_by'] = [updated_metadata['created_by']] if updated_metadata['created_by'] else [user_id]
+            elif 'created_by' not in updated_metadata:
+                updated_metadata['created_by'] = [user_id]
+            
+            # Add processing metadata
+            current_time = datetime.utcnow().isoformat() + 'Z'
             updated_metadata.update({
-                # Basic fields
-                'document_title': document_title,
-                'textSummary': summaries['comprehensive'],  # Keep for backward compatibility
-                'embedding': document_embedding,  # Document-level embedding
-                'processed_at': datetime.utcnow().isoformat() + 'Z',
-                
-                # Enhanced summarization
-                'summaries': summaries,
-                'content_structure': content_structure,
-                
-                # Enhanced RAG fields
-                'chunk_embeddings': chunk_embeddings,
-                'total_chunks': len(chunk_embeddings),
-                'text_length': len(extracted_text),
-                'chunk_size': self.chunk_size,
-                'chunk_overlap': self.chunk_overlap,
-                
-                # Model information
-                'embedding_model': 'text-embedding-3-large',
-                'summary_model': 'gpt-4o',
-                'title_model': 'gpt-4o',
-                'processing_version': '2.0'
+                'textSummary': f"Document contains {len(extracted_text)} characters across {len(chunk_embeddings)} chunks",
+                'embedding': True,  # Flag to indicate embeddings are stored separately
+                'processed_at': current_time,
+                'chunk_count': len(chunk_embeddings),
+                'processing_version': '2.0',
+                'text_length': len(extracted_text)
             })
             
-            # Save updated metadata to Cosmos DB
-            logger.info("Updating enhanced metadata in Cosmos DB...")
-            self.update_metadata_in_cosmos(updated_metadata)
+            # Update the original metadata document
+            try:
+                self.container.upsert_item(updated_metadata)
+                logger.info(f"Successfully updated metadata for file: {file_id}")
+            except Exception as e:
+                logger.error(f"Error updating metadata: {str(e)}")
+                return False, f"Failed to update metadata: {str(e)}", metadata
             
-            return True, "Success", updated_metadata
-        
+            logger.info(f"Successfully processed file {file_id} with {stored_count} chunks")
+            return True, f"Successfully processed with {stored_count} chunks", updated_metadata
+            
         except Exception as e:
-            logger.error(f"Error processing enhanced file metadata: {str(e)}")
-            return False, str(e), metadata
+            logger.error(f"Error processing file metadata: {str(e)}")
+            return False, f"Error processing file: {str(e)}", metadata
 
-   
-
-    def process_file_metadata(self, file_id: str, user_id: str, file_path: str) -> Dict[str, Any]:
-        """Process file metadata - enhanced implementation"""
+    def generate_text_summary(self, text: str, filename: str) -> str:
+        """Generate a comprehensive text summary using GPT-4o"""
         try:
-            logger.info(f"Starting enhanced metadata processing for file_id: {file_id}")
+            # Truncate text if too long (GPT-4o context limit consideration)
+            max_chars = 12000  # Conservative limit
+            if len(text) > max_chars:
+                text = text[:max_chars] + "... [truncated]"
             
-            # Get existing metadata with user_id as partition key
-            existing_metadata = self.get_existing_metadata(file_id, user_id)
-            logger.info(f"Retrieved existing metadata for file: {file_id}")
+            prompt = f"""
+            Please provide a comprehensive summary of the following document titled "{filename}".
             
-            # Check if metadata is already updated
-            if self.is_metadata_updated(existing_metadata):
-                logger.info(f"Metadata already updated for file: {file_id}")
-                return existing_metadata
+            Include:
+            1. Main purpose and content overview
+            2. Key topics and themes discussed
+            3. Important data, figures, or findings (if any)
+            4. Document structure and organization
+            5. Target audience or use case
             
-            # Process the file with enhanced metadata
-            success, message, updated_metadata = self.process_single_file_metadata(existing_metadata)
+            Document content:
+            {text}
             
-            if success:
-                logger.info(f"Successfully processed enhanced metadata for file: {file_id}")
-                return updated_metadata
-            else:
-                logger.error(f"Failed to process enhanced metadata for file: {file_id}, Error: {message}")
-                raise Exception(f"Processing failed: {message}")
-        
+            Summary:
+            """
+            
+            response = self.openai_text_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert document analyst. Provide clear, concise, and informative summaries."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"Generated summary for {filename}: {len(summary)} characters")
+            return summary
+            
         except Exception as e:
-            logger.error(f"Error in process_file_metadata: {str(e)}")
-            raise Exception(f"Failed to process file metadata: {str(e)}")
+            logger.error(f"Error generating text summary: {str(e)}")
+            return f"Summary could not be generated for {filename}"
 
-    def bulk_update_metadata(self, user_id: Optional[str] = None, batch_size: int = 10) -> Dict[str, Any]:
-        """Bulk update metadata for old records"""
+    def batch_process_metadata(self, user_id: Optional[str] = None, batch_size: int = 10) -> Dict[str, Any]:
+        """Process metadata in batches with improved error handling and RBAC support"""
         try:
-            logger.info(f"Starting bulk metadata update for user: {user_id or 'all users'}")
+            logger.info(f"Starting batch metadata processing for user: {user_id or 'all users'}")
             
-            # Get all old metadata records
+            # Get all old metadata that needs updating
             old_metadata_items = self.get_all_old_metadata(user_id)
             
             if not old_metadata_items:
-                logger.info("No items found that need metadata updates")
+                logger.info("No metadata items found that need updating")
                 return {
+                    'status': 'success',
                     'total_items': 0,
                     'processed': 0,
                     'successful': 0,
                     'failed': 0,
-                    'errors': []
+                    'results': []
                 }
             
-            # Process in batches
             total_items = len(old_metadata_items)
-            processed = 0
-            successful = 0
-            failed = 0
-            errors = []
+            logger.info(f"Found {total_items} items to process")
             
-            logger.info(f"Processing {total_items} items in batches of {batch_size}")
+            results = {
+                'status': 'success',
+                'total_items': total_items,
+                'processed': 0,
+                'successful': 0,
+                'failed': 0,
+                'results': []
+            }
             
+            # Process in batches
             for i in range(0, total_items, batch_size):
                 batch = old_metadata_items[i:i + batch_size]
                 logger.info(f"Processing batch {i//batch_size + 1}/{(total_items + batch_size - 1)//batch_size}")
                 
                 for metadata in batch:
                     try:
-                        file_id = metadata.get('id')
-                        logger.info(f"Processing file: {file_id}")
+                        file_id = metadata.get('id', 'unknown')
+                        filename = metadata.get('fileName', 'unknown')
+                        
+                        logger.info(f"Processing file: {filename} (ID: {file_id})")
                         
                         success, message, updated_metadata = self.process_single_file_metadata(metadata)
-                        processed += 1
+                        
+                        result = {
+                            'file_id': file_id,
+                            'filename': filename,
+                            'success': success,
+                            'message': message
+                        }
+                        
+                        results['results'].append(result)
+                        results['processed'] += 1
                         
                         if success:
-                            successful += 1
-                            logger.info(f"Successfully updated: {file_id}")
+                            results['successful'] += 1
+                            logger.info(f"✓ Successfully processed: {filename}")
                         else:
-                            failed += 1
-                            error_msg = f"Failed to update {file_id}: {message}"
-                            logger.error(error_msg)
-                            errors.append(error_msg)
+                            results['failed'] += 1
+                            logger.error(f"✗ Failed to process: {filename} - {message}")
                     
                     except Exception as e:
-                        processed += 1
-                        failed += 1
-                        error_msg = f"Exception processing {metadata.get('id', 'unknown')}: {str(e)}"
-                        logger.error(error_msg)
-                        errors.append(error_msg)
+                        results['processed'] += 1
+                        results['failed'] += 1
+                        error_message = f"Unexpected error: {str(e)}"
+                        
+                        results['results'].append({
+                            'file_id': metadata.get('id', 'unknown'),
+                            'filename': metadata.get('fileName', 'unknown'),
+                            'success': False,
+                            'message': error_message
+                        })
+                        
+                        logger.error(f"✗ Unexpected error processing {metadata.get('fileName', 'unknown')}: {str(e)}")
                 
-                # Add small delay between batches to avoid overwhelming services
+                # Small delay between batches to avoid overwhelming services
                 if i + batch_size < total_items:
                     time.sleep(1)
             
-            result = {
-                'total_items': total_items,
-                'processed': processed,
-                'successful': successful,
-                'failed': failed,
-                'errors': errors[:50]  # Limit errors to first 50
-            }
+            # Update overall status based on results
+            if results['failed'] == 0:
+                results['status'] = 'success'
+            elif results['successful'] > 0:
+                results['status'] = 'partial_success'
+            else:
+                results['status'] = 'failed'
             
-            logger.info(f"Bulk update completed: {result}")
-            return result
-        
+            logger.info(f"Batch processing completed. Successful: {results['successful']}, Failed: {results['failed']}")
+            return results
+            
         except Exception as e:
-            logger.error(f"Error in bulk metadata update: {str(e)}")
-            raise Exception(f"Bulk update failed: {str(e)}")
+            logger.error(f"Error in batch processing: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'total_items': 0,
+                'processed': 0,
+                'successful': 0,
+                'failed': 0,
+                'results': []
+            }
 
-    def search_similar_content(self, query_text: str, user_id: str, limit: int = 10, similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
-        """Search for similar content using embeddings"""
+    def delete_chunk_documents(self, file_id: str, user_id: str) -> bool:
+        """Delete all chunk documents for a specific file"""
         try:
-            # Generate embedding for query
-            response = self.openai_embedding_client.embeddings.create(
-                model="text-embedding-3-large",
-                input=query_text,
-                encoding_format="float"
-            )
-            query_embedding = response.data[0].embedding
+            # Query for all chunks belonging to this file
+            query = "SELECT c.id FROM c WHERE c.file_id = @file_id AND c.user_id = @user_id"
+            parameters = [
+                {"name": "@file_id", "value": file_id},
+                {"name": "@user_id", "value": user_id}
+            ]
             
-            # Query Cosmos DB for documents with embeddings
-            query = """
-                SELECT c.id, c.fileName, c.document_title, c.summaries, c.chunk_embeddings, c.embedding
-                FROM c 
-                WHERE c.user_id = @user_id 
-                AND IS_DEFINED(c.embedding) 
-                AND IS_DEFINED(c.chunk_embeddings)
-            """
+            chunk_items = list(self.container.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
             
-            parameters = [{"name": "@user_id", "value": user_id}]
+            deleted_count = 0
+            for chunk in chunk_items:
+                try:
+                    self.container.delete_item(item=chunk['id'], partition_key=user_id)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.error(f"Error deleting chunk {chunk['id']}: {str(e)}")
+            
+            logger.info(f"Deleted {deleted_count} chunk documents for file {file_id}")
+            return deleted_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error deleting chunk documents: {str(e)}")
+            return False
+
+    def reprocess_file_metadata(self, file_id: str, user_id: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """Reprocess a specific file's metadata, replacing existing chunks"""
+        try:
+            logger.info(f"Reprocessing file metadata for: {file_id}")
+            
+            # Get existing metadata
+            existing_metadata = self.get_existing_metadata(file_id, user_id)
+            
+            # Delete existing chunk documents
+            self.delete_chunk_documents(file_id, user_id)
+            
+            # Reset processing flags in metadata
+            reset_metadata = existing_metadata.copy()
+            reset_metadata.pop('textSummary', None)
+            reset_metadata.pop('embedding', None)
+            reset_metadata.pop('processed_at', None)
+            reset_metadata.pop('chunk_count', None)
+            reset_metadata.pop('text_length', None)
+            
+            # Process the file again
+            return self.process_single_file_metadata(reset_metadata)
+            
+        except Exception as e:
+            logger.error(f"Error reprocessing file metadata: {str(e)}")
+            return False, f"Error reprocessing file: {str(e)}", {}
+
+    def get_processing_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get statistics about processed vs unprocessed files"""
+        try:
+            if user_id:
+                query = "SELECT * FROM c WHERE c.user_id = @user_id"
+                parameters = [{"name": "@user_id", "value": user_id}]
+            else:
+                query = "SELECT * FROM c"
+                parameters = []
             
             items = list(self.container.query_items(
                 query=query,
@@ -879,322 +968,228 @@ class FileMetadataGenerator:
                 enable_cross_partition_query=True
             ))
             
-            # Calculate similarities
-            results = []
+            total_files = len(items)
+            processed_files = 0
+            unprocessed_files = 0
+            chunk_documents = 0
+            
             for item in items:
-                # Document-level similarity
-                doc_embedding = item.get('embedding', [])
-                if doc_embedding:
-                    doc_similarity = self.calculate_cosine_similarity(query_embedding, doc_embedding)
-                    
-                    # Chunk-level similarities
-                    chunk_results = []
-                    chunk_embeddings = item.get('chunk_embeddings', [])
-                    
-                    for chunk in chunk_embeddings:
-                        chunk_embedding = chunk.get('embedding', [])
-                        if chunk_embedding:
-                            chunk_similarity = self.calculate_cosine_similarity(query_embedding, chunk_embedding)
-                            
-                            if chunk_similarity >= similarity_threshold:
-                                chunk_results.append({
-                                    'chunk_index': chunk.get('chunk_index'),
-                                    'text': chunk.get('text', '')[:200] + '...',  # Truncate for response
-                                    'similarity': chunk_similarity,
-                                    'start_char': chunk.get('start_char'),
-                                    'end_char': chunk.get('end_char')
-                                })
-                    
-                    # Sort chunks by similarity
-                    chunk_results.sort(key=lambda x: x['similarity'], reverse=True)
-                    
-                    if doc_similarity >= similarity_threshold or chunk_results:
-                        results.append({
-                            'file_id': item['id'],
-                            'filename': item.get('fileName', ''),
-                            'document_title': item.get('document_title', ''),
-                            'document_similarity': doc_similarity,
-                            'brief_summary': item.get('summaries', {}).get('brief', ''),
-                            'matching_chunks': chunk_results[:5],  # Top 5 matching chunks
-                            'total_matching_chunks': len(chunk_results)
-                        })
-            
-            # Sort by document similarity
-            results.sort(key=lambda x: x['document_similarity'], reverse=True)
-            
-            return results[:limit]
-        
-        except Exception as e:
-            logger.error(f"Error in similarity search: {str(e)}")
-            return []
-
-    def calculate_cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculate cosine similarity between two vectors"""
-        try:
-            if len(vec1) != len(vec2):
-                return 0.0
-            
-            dot_product = sum(a * b for a, b in zip(vec1, vec2))
-            magnitude1 = sum(a * a for a in vec1) ** 0.5
-            magnitude2 = sum(b * b for b in vec2) ** 0.5
-            
-            if magnitude1 == 0.0 or magnitude2 == 0.0:
-                return 0.0
-            
-            return dot_product / (magnitude1 * magnitude2)
-        
-        except Exception as e:
-            logger.error(f"Error calculating cosine similarity: {str(e)}")
-            return 0.0
-
-    def get_file_analytics(self, user_id: str) -> Dict[str, Any]:
-        """Get analytics about processed files"""
-        try:
-            query = """
-                SELECT 
-                    COUNT(1) as total_files,
-                    SUM(c.text_length) as total_text_length,
-                    SUM(c.total_chunks) as total_chunks,
-                    AVG(c.text_length) as avg_text_length,
-                    AVG(c.total_chunks) as avg_chunks_per_file
-                FROM c 
-                WHERE c.user_id = @user_id 
-                AND IS_DEFINED(c.processed_at)
-            """
-            
-            parameters = [{"name": "@user_id", "value": user_id}]
-            
-            results = list(self.container.query_items(
-                query=query,
-                parameters=parameters,
-                enable_cross_partition_query=True
-            ))
-            
-            if results:
-                analytics = results[0]
+                if self.is_metadata_updated(item):
+                    processed_files += 1
+                else:
+                    unprocessed_files += 1
                 
-                # Get file type distribution
-                type_query = """
-                    SELECT c.fileType, COUNT(1) as count
-                    FROM c 
-                    WHERE c.user_id = @user_id 
-                    AND IS_DEFINED(c.processed_at)
-                    GROUP BY c.fileType
-                """
-                
-                type_results = list(self.container.query_items(
-                    query=type_query,
-                    parameters=parameters,
-                    enable_cross_partition_query=True
-                ))
-                
-                analytics['file_type_distribution'] = {item['fileType']: item['count'] for item in type_results}
-                
-                return analytics
+                # Count chunk documents (they have chunk_index field)
+                if 'chunk_index' in item:
+                    chunk_documents += 1
             
             return {
-                'total_files': 0,
-                'total_text_length': 0,
-                'total_chunks': 0,
-                'avg_text_length': 0,
-                'avg_chunks_per_file': 0,
-                'file_type_distribution': {}
+                'total_files': total_files,
+                'processed_files': processed_files,
+                'unprocessed_files': unprocessed_files,
+                'chunk_documents': chunk_documents,
+                'processing_percentage': (processed_files / total_files * 100) if total_files > 0 else 0
             }
-        
+            
         except Exception as e:
-            logger.error(f"Error getting file analytics: {str(e)}")
-            return {}
+            logger.error(f"Error getting processing stats: {str(e)}")
+            return {
+                'error': str(e),
+                'total_files': 0,
+                'processed_files': 0,
+                'unprocessed_files': 0,
+                'chunk_documents': 0,
+                'processing_percentage': 0
+            }
 
 
-# Flask Application
+# Flask application
 app = Flask(__name__)
 
 # Initialize the metadata generator
 metadata_generator = FileMetadataGenerator()
 
-def rate_limit_decorator(max_requests: int = 100, time_window: int = 3600):
-    """Simple rate limiting decorator"""
-    request_counts = defaultdict(list)
-    
-    def decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            client_ip = request.remote_addr
-            current_time = time.time()
-            
-            # Clean old requests
-            request_counts[client_ip] = [
-                req_time for req_time in request_counts[client_ip]
-                if current_time - req_time < time_window
-            ]
-            
-            # Check rate limit
-            if len(request_counts[client_ip]) >= max_requests:
-                return jsonify({'error': 'Rate limit exceeded'}), 429
-            
-            # Add current request
-            request_counts[client_ip].append(current_time)
-            
+def handle_exceptions(f):
+    """Decorator to handle exceptions in Flask routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        try:
             return f(*args, **kwargs)
-        return wrapper
-    return decorator
-
-@app.errorhandler(BadRequest)
-def handle_bad_request(e):
-    return jsonify({'error': 'Bad request', 'message': str(e)}), 400
-
-@app.errorhandler(NotFound)
-def handle_not_found(e):
-    return jsonify({'error': 'Not found', 'message': str(e)}), 404
-
-@app.errorhandler(InternalServerError)
-def handle_internal_error(e):
-    return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
+        except BadRequest as e:
+            logger.error(f"Bad request error: {str(e)}")
+            return jsonify({'error': 'Bad request', 'message': str(e)}), 400
+        except NotFound as e:
+            logger.error(f"Not found error: {str(e)}")
+            return jsonify({'error': 'Not found', 'message': str(e)}), 404
+        except Exception as e:
+            logger.error(f"Internal server error: {str(e)}")
+            return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
+    return decorated_function
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'service': 'file-metadata-generator'
+    }), 200
 
 @app.route('/process-metadata', methods=['POST'])
-@rate_limit_decorator(max_requests=50, time_window=3600)
+@handle_exceptions
 def process_metadata():
-    """Process file metadata endpoint"""
+    """Process metadata for files"""
     try:
         data = request.get_json()
         
         if not data:
             raise BadRequest("No JSON data provided")
         
-        file_id = data.get('fileId')
-        user_id = data.get('userId')
-        file_path = data.get('filePath')
-        
-        if not all([file_id, user_id, file_path]):
-            raise BadRequest("Missing required fields: fileId, userId, filePath")
-        
-        logger.info(f"Processing metadata request for file: {file_id}")
-        
-        # Process the metadata
-        result = metadata_generator.process_file_metadata(file_id, user_id, file_path)
-        
-        return jsonify({
-            'success': True,
-            'message': 'Metadata processed successfully',
-            'fileId': file_id,
-            'enhanced_features': {
-                'document_title': result.get('document_title'),
-                'total_chunks': result.get('total_chunks'),
-                'processing_version': result.get('processing_version')
-            }
-        }), 200
-    
-    except BadRequest as e:
-        logger.error(f"Bad request in process_metadata: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 400
-    
-    except Exception as e:
-        logger.error(f"Error in process_metadata: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/bulk-update', methods=['POST'])
-@rate_limit_decorator(max_requests=5, time_window=3600)
-def bulk_update():
-    """Bulk update metadata endpoint"""
-    try:
-        data = request.get_json() or {}
-        user_id = data.get('userId')
-        batch_size = data.get('batchSize', 10)
-        
-        if batch_size > 50:
-            batch_size = 50  # Limit batch size
-        
-        logger.info(f"Starting bulk metadata update for user: {user_id}")
-        
-        # Start bulk update
-        result = metadata_generator.bulk_update_metadata(user_id, batch_size)
-        
-        return jsonify({
-            'success': True,
-            'message': 'Bulk update completed',
-            'results': result
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"Error in bulk_update: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/search-similar', methods=['POST'])
-@rate_limit_decorator(max_requests=100, time_window=3600)
-def search_similar():
-    """Search for similar content endpoint"""
-    try:
-        data = request.get_json()
-        
-        if not data:
-            raise BadRequest("No JSON data provided")
-        
-        query_text = data.get('query')
-        user_id = data.get('userId')
-        limit = data.get('limit', 10)
-        similarity_threshold = data.get('similarity_threshold', 0.7)
-        
-        if not all([query_text, user_id]):
-            raise BadRequest("Missing required fields: query, userId")
-        
-        if limit > 50:
-            limit = 50  # Limit results
-        
-        logger.info(f"Searching similar content for user: {user_id}")
-        
-        # Search for similar content
-        results = metadata_generator.search_similar_content(
-            query_text, user_id, limit, similarity_threshold
-        )
-        
-        return jsonify({
-            'success': True,
-            'query': query_text,
-            'results': results,
-            'total_results': len(results)
-        }), 200
-    
-    except BadRequest as e:
-        logger.error(f"Bad request in search_similar: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 400
-    
-    except Exception as e:
-        logger.error(f"Error in search_similar: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/analytics', methods=['GET'])
-@rate_limit_decorator(max_requests=100, time_window=3600)
-def get_analytics():
-    """Get file analytics endpoint"""
-    try:
-        user_id = request.args.get('userId')
+        user_id = data.get('user_id')
+        batch_size = data.get('batch_size', 10)
         
         if not user_id:
-            raise BadRequest("Missing required parameter: userId")
+            raise BadRequest("user_id is required")
         
-        logger.info(f"Getting analytics for user: {user_id}")
+        logger.info(f"Starting metadata processing for user: {user_id}")
         
-        # Get analytics
-        analytics = metadata_generator.get_file_analytics(user_id)
+        # Process metadata in batches
+        results = metadata_generator.batch_process_metadata(user_id, batch_size)
+        
+        return jsonify(results), 200
+        
+    except Exception as e:
+        logger.error(f"Error in process_metadata endpoint: {str(e)}")
+        raise
+
+@app.route('/process-single-file', methods=['POST'])
+@handle_exceptions
+def process_single_file():
+    """Process metadata for a single file"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            raise BadRequest("No JSON data provided")
+        
+        file_id = data.get('file_id')
+        user_id = data.get('user_id')
+        
+        if not file_id or not user_id:
+            raise BadRequest("file_id and user_id are required")
+        
+        logger.info(f"Processing single file: {file_id} for user: {user_id}")
+        
+        # Get existing metadata
+        existing_metadata = metadata_generator.get_existing_metadata(file_id, user_id)
+        
+        # Process the file
+        success, message, updated_metadata = metadata_generator.process_single_file_metadata(existing_metadata)
         
         return jsonify({
-            'success': True,
-            'user_id': user_id,
-            'analytics': analytics
-        }), 200
-    
-    except BadRequest as e:
-        logger.error(f"Bad request in get_analytics: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 400
-    
+            'success': success,
+            'message': message,
+            'file_id': file_id,
+            'metadata': updated_metadata if success else None
+        }), 200 if success else 400
+        
     except Exception as e:
-        logger.error(f"Error in get_analytics: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"Error in process_single_file endpoint: {str(e)}")
+        raise
+
+@app.route('/reprocess-file', methods=['POST'])
+@handle_exceptions
+def reprocess_file():
+    """Reprocess metadata for a specific file"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            raise BadRequest("No JSON data provided")
+        
+        file_id = data.get('file_id')
+        user_id = data.get('user_id')
+        
+        if not file_id or not user_id:
+            raise BadRequest("file_id and user_id are required")
+        
+        logger.info(f"Reprocessing file: {file_id} for user: {user_id}")
+        
+        # Reprocess the file
+        success, message, updated_metadata = metadata_generator.reprocess_file_metadata(file_id, user_id)
+        
+        return jsonify({
+            'success': success,
+            'message': message,
+            'file_id': file_id,
+            'metadata': updated_metadata if success else None
+        }), 200 if success else 400
+        
+    except Exception as e:
+        logger.error(f"Error in reprocess_file endpoint: {str(e)}")
+        raise
+
+@app.route('/processing-stats', methods=['GET'])
+@handle_exceptions
+def get_processing_stats():
+    """Get processing statistics"""
+    try:
+        user_id = request.args.get('user_id')
+        
+        logger.info(f"Getting processing stats for user: {user_id or 'all users'}")
+        
+        stats = metadata_generator.get_processing_stats(user_id)
+        
+        return jsonify(stats), 200
+        
+    except Exception as e:
+        logger.error(f"Error in get_processing_stats endpoint: {str(e)}")
+        raise
+
+@app.route('/delete-chunks', methods=['DELETE'])
+@handle_exceptions
+def delete_file_chunks():
+    """Delete all chunks for a specific file"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            raise BadRequest("No JSON data provided")
+        
+        file_id = data.get('file_id')
+        user_id = data.get('user_id')
+        
+        if not file_id or not user_id:
+            raise BadRequest("file_id and user_id are required")
+        
+        logger.info(f"Deleting chunks for file: {file_id} user: {user_id}")
+        
+        success = metadata_generator.delete_chunk_documents(file_id, user_id)
+        
+        return jsonify({
+            'success': success,
+            'message': f"Chunks {'deleted' if success else 'not found or failed to delete'}",
+            'file_id': file_id
+        }), 200 if success else 404
+        
+    except Exception as e:
+        logger.error(f"Error in delete_file_chunks endpoint: {str(e)}")
+        raise
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    # Run the Flask application
+    port = int(os.getenv('PORT', 8000))
+    debug = os.getenv('DEBUG', 'False').lower() == 'true'
+    
+    logger.info(f"Starting File Metadata Generator service on port {port}")
+    logger.info(f"Debug mode: {debug}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
