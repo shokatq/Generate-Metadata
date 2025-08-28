@@ -82,6 +82,100 @@ class FileMetadataGenerator:
         self.chunk_size = 1000  # Characters per chunk
         self.chunk_overlap = 200  # Overlap between chunks
 
+    def check_blob_exists(self, user_id: str, blob_name: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check if a blob already exists for the given user and blob name.
+        Returns (exists, blob_path) tuple.
+        """
+        try:
+            # Construct the blob path: {user_id}/{blob_name}
+            blob_path = f"{user_id}/{blob_name}"
+            
+            logger.info(f"Checking if blob exists: {blob_path}")
+            
+            # Get blob client
+            blob_client = self.blob_service_client.get_blob_client(
+                container=self.container_name,
+                blob=blob_path
+            )
+            
+            # Check if blob exists
+            exists = blob_client.exists()
+            
+            if exists:
+                logger.info(f"Blob already exists: {blob_path}")
+                return True, blob_path
+            else:
+                logger.info(f"Blob does not exist: {blob_path}")
+                return False, blob_path
+                
+        except Exception as e:
+            logger.error(f"Error checking blob existence: {str(e)}")
+            # In case of error, assume blob doesn't exist to allow processing
+            return False, f"{user_id}/{blob_name}"
+
+    def validate_file_before_processing(self, metadata: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
+        """
+        Validate if the file should be processed based on blob existence.
+        Returns (should_process, message, suggested_blob_path) tuple.
+        """
+        try:
+            user_id = metadata.get('user_id')
+            filename = metadata.get('fileName', '')
+            file_path = metadata.get('filePath', '')
+            
+            if not user_id:
+                return False, "User ID is required for validation", None
+            
+            if not filename:
+                return False, "Filename is required for validation", None
+            
+            # Extract blob name from filename or file path
+            blob_name = os.path.basename(filename) if filename else os.path.basename(file_path)
+            
+            if not blob_name:
+                return False, "Could not determine blob name from filename or file path", None
+            
+            # Check if blob already exists
+            exists, suggested_blob_path = self.check_blob_exists(user_id, blob_name)
+            
+            if exists:
+                return False, f"File '{blob_name}' already exists for user '{user_id}'. Skipping to prevent duplication.", suggested_blob_path
+            else:
+                return True, f"File '{blob_name}' is new for user '{user_id}'. Proceeding with processing.", suggested_blob_path
+                
+        except Exception as e:
+            logger.error(f"Error during file validation: {str(e)}")
+            # In case of validation error, allow processing to continue
+            return True, f"Validation error occurred, proceeding with processing: {str(e)}", None
+
+    def get_blob_metadata(self, blob_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Get metadata for an existing blob.
+        """
+        try:
+            blob_client = self.blob_service_client.get_blob_client(
+                container=self.container_name,
+                blob=blob_path
+            )
+            
+            if blob_client.exists():
+                properties = blob_client.get_blob_properties()
+                return {
+                    'size': properties.size,
+                    'last_modified': properties.last_modified,
+                    'content_type': properties.content_settings.content_type,
+                    'etag': properties.etag,
+                    'creation_time': properties.creation_time,
+                    'blob_path': blob_path
+                }
+            else:
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting blob metadata: {str(e)}")
+            return None
+
     def extract_departments_from_path(self, file_path: str) -> List[str]:
         """Extract departments from file path based on directory structure"""
         departments = []
@@ -632,7 +726,7 @@ class FileMetadataGenerator:
             raise Exception(f"Failed to retrieve metadata: {str(e)}")
 
     def process_single_file_metadata(self, metadata: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-        """Process a single file's metadata and store chunks separately with RBAC support"""
+        """Process a single file's metadata and store chunks separately with RBAC support and blob validation"""
         try:
             file_id = metadata.get('id')
             file_path = metadata.get('filePath')
@@ -642,7 +736,16 @@ class FileMetadataGenerator:
             
             logger.info(f"Processing file metadata for: {file_id}")
             
-            # Check if file exists in blob storage
+            # STEP 1: Validate file before processing to prevent duplication
+            should_process, validation_message, suggested_blob_path = self.validate_file_before_processing(metadata)
+            
+            if not should_process:
+                logger.info(f"Skipping file processing: {validation_message}")
+                return False, validation_message, metadata
+            
+            logger.info(f"File validation passed: {validation_message}")
+            
+            # STEP 2: Check if file exists in blob storage
             try:
                 file_content = self.download_file_from_blob(file_path)
                 logger.info(f"Successfully downloaded file, size: {len(file_content)} bytes")
@@ -750,52 +853,11 @@ class FileMetadataGenerator:
             logger.error(f"Error processing file metadata: {str(e)}")
             return False, f"Error processing file: {str(e)}", metadata
 
-    def generate_text_summary(self, text: str, filename: str) -> str:
-        """Generate a comprehensive text summary using GPT-4o"""
+    def batch_process_metadata_with_validation(self, user_id: Optional[str] = None, batch_size: int = 10, 
+                                             skip_duplicates: bool = True) -> Dict[str, Any]:
+        """Process metadata in batches with blob validation to prevent duplicates"""
         try:
-            # Truncate text if too long (GPT-4o context limit consideration)
-            max_chars = 12000  # Conservative limit
-            if len(text) > max_chars:
-                text = text[:max_chars] + "... [truncated]"
-            
-            prompt = f"""
-            Please provide a comprehensive summary of the following document titled "{filename}".
-            
-            Include:
-            1. Main purpose and content overview
-            2. Key topics and themes discussed
-            3. Important data, figures, or findings (if any)
-            4. Document structure and organization
-            5. Target audience or use case
-            
-            Document content:
-            {text}
-            
-            Summary:
-            """
-            
-            response = self.openai_text_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are an expert document analyst. Provide clear, concise, and informative summaries."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=500,
-                temperature=0.3
-            )
-            
-            summary = response.choices[0].message.content.strip()
-            logger.info(f"Generated summary for {filename}: {len(summary)} characters")
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Error generating text summary: {str(e)}")
-            return f"Summary could not be generated for {filename}"
-
-    def batch_process_metadata(self, user_id: Optional[str] = None, batch_size: int = 10) -> Dict[str, Any]:
-        """Process metadata in batches with improved error handling and RBAC support"""
-        try:
-            logger.info(f"Starting batch metadata processing for user: {user_id or 'all users'}")
+            logger.info(f"Starting batch metadata processing with validation for user: {user_id or 'all users'}")
             
             # Get all old metadata that needs updating
             old_metadata_items = self.get_all_old_metadata(user_id)
@@ -808,6 +870,7 @@ class FileMetadataGenerator:
                     'processed': 0,
                     'successful': 0,
                     'failed': 0,
+                    'skipped_duplicates': 0,
                     'results': []
                 }
             
@@ -820,6 +883,7 @@ class FileMetadataGenerator:
                 'processed': 0,
                 'successful': 0,
                 'failed': 0,
+                'skipped_duplicates': 0,
                 'results': []
             }
             
@@ -835,12 +899,31 @@ class FileMetadataGenerator:
                         
                         logger.info(f"Processing file: {filename} (ID: {file_id})")
                         
+                        # Pre-validation step if skip_duplicates is enabled
+                        if skip_duplicates:
+                            should_process, validation_message, _ = self.validate_file_before_processing(metadata)
+                            if not should_process:
+                                results['skipped_duplicates'] += 1
+                                results['processed'] += 1
+                                
+                                result = {
+                                    'file_id': file_id,
+                                    'filename': filename,
+                                    'success': False,
+                                    'skipped': True,
+                                    'message': validation_message
+                                }
+                                results['results'].append(result)
+                                logger.info(f"⏭ Skipped duplicate: {filename}")
+                                continue
+                        
                         success, message, updated_metadata = self.process_single_file_metadata(metadata)
                         
                         result = {
                             'file_id': file_id,
                             'filename': filename,
                             'success': success,
+                            'skipped': False,
                             'message': message
                         }
                         
@@ -863,6 +946,7 @@ class FileMetadataGenerator:
                             'file_id': metadata.get('id', 'unknown'),
                             'filename': metadata.get('fileName', 'unknown'),
                             'success': False,
+                            'skipped': False,
                             'message': error_message
                         })
                         
@@ -880,7 +964,7 @@ class FileMetadataGenerator:
             else:
                 results['status'] = 'failed'
             
-            logger.info(f"Batch processing completed. Successful: {results['successful']}, Failed: {results['failed']}")
+            logger.info(f"Batch processing completed. Successful: {results['successful']}, Failed: {results['failed']}, Skipped duplicates: {results['skipped_duplicates']}")
             return results
             
         except Exception as e:
@@ -892,153 +976,44 @@ class FileMetadataGenerator:
                 'processed': 0,
                 'successful': 0,
                 'failed': 0,
+                'skipped_duplicates': 0,
                 'results': []
             }
 
-    def delete_chunk_documents(self, file_id: str, user_id: str) -> bool:
-        """Delete all chunk documents for a specific file"""
+    def force_process_file_metadata(self, metadata: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """Force process a file's metadata even if it already exists (bypass validation)"""
         try:
-            # Query for all chunks belonging to this file
-            query = "SELECT c.id FROM c WHERE c.file_id = @file_id AND c.user_id = @user_id"
-            parameters = [
-                {"name": "@file_id", "value": file_id},
-                {"name": "@user_id", "value": user_id}
-            ]
+            file_id = metadata.get('id')
+            filename = metadata.get('fileName', '')
+            logger.info(f"Force processing file metadata for: {file_id} - {filename}")
             
-            chunk_items = list(self.container.query_items(
-                query=query,
-                parameters=parameters,
-                enable_cross_partition_query=True
-            ))
+            # Temporarily store validation methods and replace with pass-through
+            original_validate = self.validate_file_before_processing
             
-            deleted_count = 0
-            for chunk in chunk_items:
-                try:
-                    self.container.delete_item(item=chunk['id'], partition_key=user_id)
-                    deleted_count += 1
-                except Exception as e:
-                    logger.error(f"Error deleting chunk {chunk['id']}: {str(e)}")
+            def bypass_validation(metadata):
+                return True, "Force processing - validation bypassed", metadata.get('filePath')
             
-            logger.info(f"Deleted {deleted_count} chunk documents for file {file_id}")
-            return deleted_count > 0
+            # Replace validation method
+            self.validate_file_before_processing = bypass_validation
             
-        except Exception as e:
-            logger.error(f"Error deleting chunk documents: {str(e)}")
-            return False
-
-    def reprocess_file_metadata(self, file_id: str, user_id: str) -> Tuple[bool, str, Dict[str, Any]]:
-        """Reprocess a specific file's metadata, replacing existing chunks"""
-        try:
-            logger.info(f"Reprocessing file metadata for: {file_id}")
-            
-            # Get existing metadata
-            existing_metadata = self.get_existing_metadata(file_id, user_id)
-            
-            # Delete existing chunk documents
-            self.delete_chunk_documents(file_id, user_id)
-            
-            # Reset processing flags in metadata
-            reset_metadata = existing_metadata.copy()
-            reset_metadata.pop('textSummary', None)
-            reset_metadata.pop('embedding', None)
-            reset_metadata.pop('processed_at', None)
-            reset_metadata.pop('chunk_count', None)
-            reset_metadata.pop('text_length', None)
-            
-            # Process the file again
-            return self.process_single_file_metadata(reset_metadata)
-            
-        except Exception as e:
-            logger.error(f"Error reprocessing file metadata: {str(e)}")
-            return False, f"Error reprocessing file: {str(e)}", {}
-
-    def get_processing_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get statistics about processed vs unprocessed files"""
-        try:
-            if user_id:
-                query = "SELECT * FROM c WHERE c.user_id = @user_id"
-                parameters = [{"name": "@user_id", "value": user_id}]
-            else:
-                query = "SELECT * FROM c"
-                parameters = []
-            
-            items = list(self.container.query_items(
-                query=query,
-                parameters=parameters,
-                enable_cross_partition_query=True
-            ))
-            
-            total_files = len(items)
-            processed_files = 0
-            unprocessed_files = 0
-            chunk_documents = 0
-            
-            for item in items:
-                if self.is_metadata_updated(item):
-                    processed_files += 1
-                else:
-                    unprocessed_files += 1
+            try:
+                # Process the file with bypassed validation
+                result = self.process_single_file_metadata(metadata)
+                return result
+            finally:
+                # Restore original validation method
+                self.validate_file_before_processing = original_validate
                 
-                # Count chunk documents (they have chunk_index field)
-                if 'chunk_index' in item:
-                    chunk_documents += 1
-            
-            return {
-                'total_files': total_files,
-                'processed_files': processed_files,
-                'unprocessed_files': unprocessed_files,
-                'chunk_documents': chunk_documents,
-                'processing_percentage': (processed_files / total_files * 100) if total_files > 0 else 0
-            }
-            
         except Exception as e:
-            logger.error(f"Error getting processing stats: {str(e)}")
-            return {
-                'error': str(e),
-                'total_files': 0,
-                'processed_files': 0,
-                'unprocessed_files': 0,
-                'chunk_documents': 0,
-                'processing_percentage': 0
-            }
+            logger.error(f"Error force processing file metadata: {str(e)}")
+            return False, f"Error force processing file: {str(e)}", metadata
 
-
-# Flask application
-app = Flask(__name__)
-
-# Initialize the metadata generator
-metadata_generator = FileMetadataGenerator()
-
-def handle_exceptions(f):
-    """Decorator to handle exceptions in Flask routes"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except BadRequest as e:
-            logger.error(f"Bad request error: {str(e)}")
-            return jsonify({'error': 'Bad request', 'message': str(e)}), 400
-        except NotFound as e:
-            logger.error(f"Not found error: {str(e)}")
-            return jsonify({'error': 'Not found', 'message': str(e)}), 404
-        except Exception as e:
-            logger.error(f"Internal server error: {str(e)}")
-            return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
-    return decorated_function
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'service': 'file-metadata-generator'
-    }), 200
+# Updated Flask endpoints to support validation
 
 @app.route('/process-metadata', methods=['POST'])
 @handle_exceptions
 def process_metadata():
-    """Process metadata for files"""
+    """Process metadata for files with duplicate prevention"""
     try:
         data = request.get_json()
         
@@ -1047,14 +1022,19 @@ def process_metadata():
         
         user_id = data.get('user_id')
         batch_size = data.get('batch_size', 10)
+        skip_duplicates = data.get('skip_duplicates', True)
         
         if not user_id:
             raise BadRequest("user_id is required")
         
         logger.info(f"Starting metadata processing for user: {user_id}")
         
-        # Process metadata in batches
-        results = metadata_generator.batch_process_metadata(user_id, batch_size)
+        # Process metadata in batches with validation
+        results = metadata_generator.batch_process_metadata_with_validation(
+            user_id=user_id, 
+            batch_size=batch_size,
+            skip_duplicates=skip_duplicates
+        )
         
         return jsonify(results), 200
         
@@ -1062,10 +1042,55 @@ def process_metadata():
         logger.error(f"Error in process_metadata endpoint: {str(e)}")
         raise
 
-@app.route('/process-single-file', methods=['POST'])
+@app.route('/validate-file', methods=['POST'])
 @handle_exceptions
-def process_single_file():
-    """Process metadata for a single file"""
+def validate_file():
+    """Validate if a file already exists in blob storage"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            raise BadRequest("No JSON data provided")
+        
+        user_id = data.get('user_id')
+        filename = data.get('fileName') or data.get('filename')
+        file_path = data.get('filePath') or data.get('file_path')
+        
+        if not user_id:
+            raise BadRequest("user_id is required")
+        
+        if not filename and not file_path:
+            raise BadRequest("fileName or filePath is required")
+        
+        # Create minimal metadata for validation
+        validation_metadata = {
+            'user_id': user_id,
+            'fileName': filename,
+            'filePath': file_path
+        }
+        
+        should_process, message, suggested_blob_path = metadata_generator.validate_file_before_processing(validation_metadata)
+        
+        # Get blob metadata if it exists
+        blob_metadata = None
+        if not should_process and suggested_blob_path:
+            blob_metadata = metadata_generator.get_blob_metadata(suggested_blob_path)
+        
+        return jsonify({
+            'should_process': should_process,
+            'message': message,
+            'suggested_blob_path': suggested_blob_path,
+            'existing_blob_metadata': blob_metadata
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in validate_file endpoint: {str(e)}")
+        raise
+
+@app.route('/force-process-file', methods=['POST'])
+@handle_exceptions
+def force_process_file():
+    """Force process a file bypassing duplicate validation"""
     try:
         data = request.get_json()
         
@@ -1078,118 +1103,22 @@ def process_single_file():
         if not file_id or not user_id:
             raise BadRequest("file_id and user_id are required")
         
-        logger.info(f"Processing single file: {file_id} for user: {user_id}")
+        logger.info(f"Force processing file: {file_id} for user: {user_id}")
         
         # Get existing metadata
         existing_metadata = metadata_generator.get_existing_metadata(file_id, user_id)
         
-        # Process the file
-        success, message, updated_metadata = metadata_generator.process_single_file_metadata(existing_metadata)
+        # Force process the file
+        success, message, updated_metadata = metadata_generator.force_process_file_metadata(existing_metadata)
         
         return jsonify({
             'success': success,
             'message': message,
             'file_id': file_id,
-            'metadata': updated_metadata if success else None
+            'metadata': updated_metadata if success else None,
+            'forced': True
         }), 200 if success else 400
         
     except Exception as e:
-        logger.error(f"Error in process_single_file endpoint: {str(e)}")
+        logger.error(f"Error in force_process_file endpoint: {str(e)}")
         raise
-
-@app.route('/reprocess-file', methods=['POST'])
-@handle_exceptions
-def reprocess_file():
-    """Reprocess metadata for a specific file"""
-    try:
-        data = request.get_json()
-        
-        if not data:
-            raise BadRequest("No JSON data provided")
-        
-        file_id = data.get('file_id')
-        user_id = data.get('user_id')
-        
-        if not file_id or not user_id:
-            raise BadRequest("file_id and user_id are required")
-        
-        logger.info(f"Reprocessing file: {file_id} for user: {user_id}")
-        
-        # Reprocess the file
-        success, message, updated_metadata = metadata_generator.reprocess_file_metadata(file_id, user_id)
-        
-        return jsonify({
-            'success': success,
-            'message': message,
-            'file_id': file_id,
-            'metadata': updated_metadata if success else None
-        }), 200 if success else 400
-        
-    except Exception as e:
-        logger.error(f"Error in reprocess_file endpoint: {str(e)}")
-        raise
-
-@app.route('/processing-stats', methods=['GET'])
-@handle_exceptions
-def get_processing_stats():
-    """Get processing statistics"""
-    try:
-        user_id = request.args.get('user_id')
-        
-        logger.info(f"Getting processing stats for user: {user_id or 'all users'}")
-        
-        stats = metadata_generator.get_processing_stats(user_id)
-        
-        return jsonify(stats), 200
-        
-    except Exception as e:
-        logger.error(f"Error in get_processing_stats endpoint: {str(e)}")
-        raise
-
-@app.route('/delete-chunks', methods=['DELETE'])
-@handle_exceptions
-def delete_file_chunks():
-    """Delete all chunks for a specific file"""
-    try:
-        data = request.get_json()
-        
-        if not data:
-            raise BadRequest("No JSON data provided")
-        
-        file_id = data.get('file_id')
-        user_id = data.get('user_id')
-        
-        if not file_id or not user_id:
-            raise BadRequest("file_id and user_id are required")
-        
-        logger.info(f"Deleting chunks for file: {file_id} user: {user_id}")
-        
-        success = metadata_generator.delete_chunk_documents(file_id, user_id)
-        
-        return jsonify({
-            'success': success,
-            'message': f"Chunks {'deleted' if success else 'not found or failed to delete'}",
-            'file_id': file_id
-        }), 200 if success else 404
-        
-    except Exception as e:
-        logger.error(f"Error in delete_file_chunks endpoint: {str(e)}")
-        raise
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
-
-if __name__ == '__main__':
-    # Run the Flask application
-    port = int(os.getenv('PORT', 8000))
-    debug = os.getenv('DEBUG', 'False').lower() == 'true'
-    
-    logger.info(f"Starting File Metadata Generator service on port {port}")
-    logger.info(f"Debug mode: {debug}")
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
