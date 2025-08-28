@@ -1010,6 +1010,11 @@ class FileMetadataGenerator:
 
 # Updated Flask endpoints to support validation
 
+app = Flask(__name__)
+
+# Initialize the metadata generator
+metadata_generator = FileMetadataGenerator()
+
 @app.route('/process-metadata', methods=['POST'])
 @handle_exceptions
 def process_metadata():
