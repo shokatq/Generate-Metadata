@@ -1015,6 +1015,34 @@ app = Flask(__name__)
 # Initialize the metadata generator
 metadata_generator = FileMetadataGenerator()
 
+def handle_exceptions(f):
+    """Decorator to handle exceptions in Flask routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except BadRequest as e:
+            logger.error(f"Bad request error: {str(e)}")
+            return jsonify({'error': 'Bad request', 'message': str(e)}), 400
+        except NotFound as e:
+            logger.error(f"Not found error: {str(e)}")
+            return jsonify({'error': 'Not found', 'message': str(e)}), 404
+        except Exception as e:
+            logger.error(f"Internal server error: {str(e)}")
+            return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
+    return decorated_function
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'service': 'file-metadata-generator'
+    }), 200
+
+
 @app.route('/process-metadata', methods=['POST'])
 @handle_exceptions
 def process_metadata():
