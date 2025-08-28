@@ -1122,3 +1122,21 @@ def force_process_file():
     except Exception as e:
         logger.error(f"Error in force_process_file endpoint: {str(e)}")
         raise
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    # Run the Flask application
+    port = int(os.getenv('PORT', 8000))
+    debug = os.getenv('DEBUG', 'False').lower() == 'true'
+    
+    logger.info(f"Starting File Metadata Generator service on port {port}")
+    logger.info(f"Debug mode: {debug}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
