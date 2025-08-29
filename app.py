@@ -914,6 +914,77 @@ class FileMetadataGenerator:
             logger.error(f"Error getting file chunks: {str(e)}")
             return []
 
+    def get_processing_progress(self, user_id: str) -> Dict[str, Any]:
+    """Get detailed processing progress for a user"""
+    try:
+        # Get counts of different processing states
+        queries = {
+            'total_files': """
+                SELECT COUNT(1) as count FROM c 
+                WHERE c.user_id = @user_id 
+                AND NOT IS_DEFINED(c.chunk_index)
+            """,
+            'processed_files': """
+                SELECT COUNT(1) as count FROM c 
+                WHERE c.user_id = @user_id 
+                AND IS_DEFINED(c.processed_at)
+                AND NOT IS_DEFINED(c.chunk_index)
+            """,
+            'files_with_chunks': """
+                SELECT COUNT(DISTINCT c.file_id) as count FROM c 
+                WHERE c.user_id = @user_id 
+                AND IS_DEFINED(c.chunk_index)
+            """,
+            'total_chunks': """
+                SELECT COUNT(1) as count FROM c 
+                WHERE c.user_id = @user_id 
+                AND IS_DEFINED(c.chunk_index)
+            """
+        }
+        
+        parameters = [{"name": "@user_id", "value": user_id}]
+        results = {}
+        
+        for key, query in queries.items():
+            try:
+                result = list(self.container.query_items(
+                    query=query,
+                    parameters=parameters,
+                    enable_cross_partition_query=True
+                ))
+                results[key] = result[0]['count'] if result else 0
+            except Exception as e:
+                logger.error(f"Error executing query {key}: {str(e)}")
+                results[key] = 0
+        
+        # Calculate processing percentage
+        total_files = results['total_files']
+        processed_files = results['processed_files']
+        
+        processing_percentage = 0
+        if total_files > 0:
+            processing_percentage = (processed_files / total_files) * 100
+        
+        return {
+            'user_id': user_id,
+            'total_files': total_files,
+            'processed_files': processed_files,
+            'files_with_chunks': results['files_with_chunks'],
+            'total_chunks': results['total_chunks'],
+            'processing_percentage': round(processing_percentage, 2),
+            'files_pending': total_files - processed_files,
+            'is_processing_complete': processing_percentage >= 100,
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting processing progress: {str(e)}")
+        return {
+            'user_id': user_id,
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+
     def health_check(self) -> Dict[str, Any]:
         """Perform health check on all services"""
         try:
@@ -1196,6 +1267,151 @@ def delete_old_embeddings():
         'result': result,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
+
+@app.route('/processing-stats', methods=['GET'])
+@handle_errors
+def get_processing_stats():
+    """Get processing statistics for a user"""
+    user_id = request.args.get('user_id')
+    
+    if not user_id:
+        raise BadRequest("Missing required parameter: user_id")
+    
+    logger.info(f"Getting processing stats for user: {user_id}")
+    
+    try:
+        # Query for all files (not chunks) that belong to the user
+        all_files_query = """
+            SELECT c.id, c.fileName, c.processed_at, c.total_chunks, c.text_length
+            FROM c 
+            WHERE c.user_id = @user_id 
+            AND NOT IS_DEFINED(c.chunk_index)
+        """
+        
+        # Query for processed files (files that have been updated with new metadata)
+        processed_files_query = """
+            SELECT c.id, c.fileName, c.processed_at, c.total_chunks, c.text_length
+            FROM c 
+            WHERE c.user_id = @user_id 
+            AND IS_DEFINED(c.processed_at)
+            AND NOT IS_DEFINED(c.chunk_index)
+        """
+        
+        # Query for chunks to get accurate chunk counts
+        chunks_query = """
+            SELECT COUNT(1) as total_chunks_stored
+            FROM c 
+            WHERE c.user_id = @user_id 
+            AND IS_DEFINED(c.chunk_index)
+        """
+        
+        parameters = [{"name": "@user_id", "value": user_id}]
+        
+        # Execute queries
+        all_files = list(metadata_generator.container.query_items(
+            query=all_files_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        
+        processed_files = list(metadata_generator.container.query_items(
+            query=processed_files_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        
+        chunk_results = list(metadata_generator.container.query_items(
+            query=chunks_query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        
+        total_files = len(all_files)
+        processed_count = len(processed_files)
+        total_chunks_stored = chunk_results[0]['total_chunks_stored'] if chunk_results else 0
+        
+        # Calculate processing percentage
+        processing_percentage = 0
+        if total_files > 0:
+            processing_percentage = (processed_count / total_files) * 100
+        
+        # Calculate total text length
+        total_text_length = sum(f.get('text_length', 0) for f in processed_files)
+        
+        # Get file type distribution
+        file_types = {}
+        for file_item in all_files:
+            mime_type = file_item.get('mime_type', 'unknown')
+            file_types[mime_type] = file_types.get(mime_type, 0) + 1
+        
+        # Prepare response
+        stats = {
+            'user_id': user_id,
+            'total_files': total_files,
+            'processed_files': processed_count,
+            'processing_percentage': round(processing_percentage, 2),
+            'total_chunks_stored': total_chunks_stored,
+            'total_text_length': total_text_length,
+            'file_type_distribution': file_types,
+            'files_pending_processing': total_files - processed_count,
+            'last_updated': datetime.utcnow().isoformat() + 'Z'
+        }
+        
+        # Add details about recent processing
+        if processed_files:
+            # Sort by processed_at to get most recent
+            sorted_processed = sorted(
+                [f for f in processed_files if f.get('processed_at')],
+                key=lambda x: x.get('processed_at', ''),
+                reverse=True
+            )
+            
+            if sorted_processed:
+                stats['last_processed_file'] = {
+                    'file_name': sorted_processed[0].get('fileName', ''),
+                    'processed_at': sorted_processed[0].get('processed_at', ''),
+                    'chunks': sorted_processed[0].get('total_chunks', 0)
+                }
+        
+        logger.info(f"Processing stats for {user_id}: {processed_count}/{total_files} files processed")
+        
+        return jsonify({
+            'success': True,
+            'stats': stats,
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting processing stats: {str(e)}")
+        # Return basic stats even if query fails
+        return jsonify({
+            'success': True,
+            'stats': {
+                'user_id': user_id,
+                'total_files': 0,
+                'processed_files': 0,
+                'processing_percentage': 0,
+                'total_chunks_stored': 0,
+                'total_text_length': 0,
+                'file_type_distribution': {},
+                'files_pending_processing': 0,
+                'last_updated': datetime.utcnow().isoformat() + 'Z',
+                'error': 'Could not retrieve detailed stats'
+            },
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+@app.route('/status', methods=['GET'])
+@handle_errors
+def get_status():
+    """Simple status check"""
+    return jsonify({
+        'status': 'running',
+        'service': 'metadata-generator',
+        'version': '2.0',
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
 
 @app.errorhandler(BadRequest)
 def handle_bad_request(e):
