@@ -915,8 +915,8 @@ class FileMetadataGenerator:
             return []
 
     def get_processing_progress(self, user_id: str) -> Dict[str, Any]:
-    """Get detailed processing progress for a user"""
-    try:
+     """Get detailed processing progress for a user"""
+     try:
         # Get counts of different processing states
         queries = {
             'total_files': """
@@ -977,7 +977,7 @@ class FileMetadataGenerator:
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
         
-    except Exception as e:
+     except Exception as e:
         logger.error(f"Error getting processing progress: {str(e)}")
         return {
             'user_id': user_id,
