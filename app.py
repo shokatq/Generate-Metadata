@@ -27,6 +27,7 @@ from openai import AzureOpenAI
 
 # Flask
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from werkzeug.exceptions import BadRequest, NotFound, InternalServerError
 
 # Configure logging
@@ -1001,6 +1002,7 @@ class FileMetadataGenerator:
 
 # Flask Application
 app = Flask(__name__)
+CORS(app)
 metadata_generator = FileMetadataGenerator()
 
 def handle_errors(f):
